@@ -1,4 +1,4 @@
-use super::_match::{MatchCheckCtxt, Matrix, expand_pattern, is_useful};
+use super::_match::{MatchCheckCtxt, Matrix, Witness, expand_pattern, is_useful};
 use super::_match::Usefulness::*;
 use super::_match::WitnessPreference::*;
 
@@ -53,6 +53,38 @@ pub(crate) fn check_match<'a, 'tcx>(
             param_env: tcx.param_env(def_id),
             identity_substs: Substs::identity_for_item(tcx, def_id),
         }.visit_body(tcx.hir().body(body_id));
+    })
+}
+
+pub fn is_refutable<'a, 'tcx>(
+    pat: &'tcx Pat,
+    tcx: TyCtxt<'a, 'tcx, 'tcx>,
+    tables: &'a ty::TypeckTables<'tcx>,
+    param_env: ty::ParamEnv<'tcx>,
+    identity_substs: &'tcx Substs<'tcx>,
+) -> Option<Vec<Witness<'tcx>>> {
+    let module = tcx.hir().get_module_parent(pat.id);
+    MatchCheckCtxt::create_and_enter(tcx, param_env, module, |ref mut cx| {
+        let mut patcx = PatternContext::new(tcx,
+                                            param_env.and(identity_substs),
+                                            tables);
+        let pattern = patcx.lower_pattern(pat);
+        let pattern_ty = pattern.ty;
+        let pats: Matrix<'_, '_> = vec![smallvec![
+                expand_pattern(cx, pattern)
+            ]].into_iter().collect();
+
+        let wild_pattern = Pattern {
+            ty: pattern_ty,
+            span: DUMMY_SP,
+            kind: box PatternKind::Wild,
+        };
+
+        match is_useful(cx, &pats, &[&wild_pattern], ConstructWitness) {
+            UsefulWithWitness(witness) => Some(witness),
+            NotUseful => None,
+            Useful => bug!()
+        }
     })
 }
 
@@ -241,28 +273,7 @@ impl<'a, 'tcx> MatchVisitor<'a, 'tcx> {
     }
 
     fn check_irrefutable(&self, pat: &'tcx Pat, origin: &str) {
-        let module = self.tcx.hir().get_module_parent(pat.id);
-        MatchCheckCtxt::create_and_enter(self.tcx, self.param_env, module, |ref mut cx| {
-            let mut patcx = PatternContext::new(self.tcx,
-                                                self.param_env.and(self.identity_substs),
-                                                self.tables);
-            let pattern = patcx.lower_pattern(pat);
-            let pattern_ty = pattern.ty;
-            let pats: Matrix<'_, '_> = vec![smallvec![
-                expand_pattern(cx, pattern)
-            ]].into_iter().collect();
-
-            let wild_pattern = Pattern {
-                ty: pattern_ty,
-                span: DUMMY_SP,
-                kind: box PatternKind::Wild,
-            };
-            let witness = match is_useful(cx, &pats, &[&wild_pattern], ConstructWitness) {
-                UsefulWithWitness(witness) => witness,
-                NotUseful => return,
-                Useful => bug!()
-            };
-
+        if let Some(witness) = is_refutable(pat, self.tcx, self.tables, self.param_env, self.identity_substs) {
             let pattern_string = witness[0].single_pattern().to_string();
             let mut diag = struct_span_err!(
                 self.tcx.sess, pat.span, E0005,
@@ -279,7 +290,7 @@ impl<'a, 'tcx> MatchVisitor<'a, 'tcx> {
             };
             diag.span_label(pat.span, label_msg);
             diag.emit();
-        });
+        };
     }
 }
 
